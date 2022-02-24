@@ -1,0 +1,231 @@
+---
+title: "Group assignment v.2"
+author: "536043_Bussing"
+date: "15-6-2020"
+output: html_document
+---
+
+
+---------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------- 1. LOAD PACKAGES AND DATA ---------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------
+
+
+# Load packages
+```{r}
+library(tidyverse)
+library(Boruta)
+library(caret)
+library(glmnet)
+library(broom)
+library(knitr)
+library(rmarkdown)
+```
+
+
+# Load train data set and select relevant columns
+```{r}
+train_full <- read.csv("train.csv", sep = ";", na = c("N/A", "n/a","NA","na"))
+train <- train_full[c("loan_amnt",	"term",	"int_rate",	"installment",	"sub_grade",	"emp_length",	"home_ownership",	"annual_inc",	"verification_status",	"loan_status",	"title",	"addr_state", "dti",	"delinq_2yrs",	"fico_range_low",	"fico_range_high",	"revol_bal",	"revol_util",	"initial_list_status",	"last_fico_range_high",	"last_fico_range_low",	"application_type",	"annual_inc_joint",	"dti_joint",	"verification_status_joint",	"chargeoff_within_12_mths",	"mort_acc",	"percent_bc_gt_75",	"revol_bal_joint",	"hardship_flag")]
+```
+
+
+# Functions (I like to list them all at the beginning)
+```{r}
+#Replace blank cells with NAs
+empty_as_na <- function(x){
+    if("factor" %in% class(x)) x <- as.character(x)
+    ifelse(as.character(x)!="", x, NA)
+}
+
+#Count outliers and show boxplots and histogram before and after removel
+outliers <- function(df, var, col_number) {
+  x <- eval(substitute(var),eval(df))
+  na1 <- sum(is.na(x))
+  m1 <- mean(x, na.rm = TRUE)
+  par(mfrow = c(2, 2), oma = c(0,0,3,0))
+  boxplot(x, main = names((df)[col_number]) %>% paste("distribution"))
+  hist(x, main = names((df)[col_number]) %>% paste("distribution"), breaks = 20, border = "red", xlab = NA, ylab = NA)
+  outlier <- boxplot.stats(x)$out
+  m_out <- mean(outlier)
+  x <- ifelse(x %in% outlier, NA, x)
+  boxplot(x, main = names((df)[col_number]) %>% paste("without outliers"))
+  hist(x, main = names((df)[col_number]) %>% paste("without outliers"), breaks = 20, border = "blue", xlab = NA, ylab = NA)
+  na2 <- sum(is.na(x))
+  cat("Outliers identified:", na2 - na1, "n")
+  cat("Proportion (%) of outliers:", round((na2 - na1) / sum(!is.na(x))*100, 1), "n")
+}
+
+#Winsorize outliers at the 1st a nd 99th percentile
+winsorize <- function(dt,var){
+  q <- quantile(var, c(0.01, 0.99), na.rm = TRUE)
+  dt$Wvar <- var
+  dt[dt$Wvar < q[1], "Wvar"] <- q[1]
+  dt[dt$Wvar > q[2], "Wvar"] <- q[2]
+  return(Wvar)
+}
+```
+
+
+---------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------- 2. DATA EXPLORATION ---------------------------------------------------------
+---------------------------------------------------------------------------------------------------------------------------------
+
+
+# General inspection
+```{r}
+str(train)
+summary(train)
+sum(is.na(train))
+
+#correlation visualization --> doesn't work for me!
+train %>%
+  filter(loan_status == "yes") %>%
+  select_if(is.numeric) %>%
+  cor() %>%
+  corrplot::corrplot(type="upper",tl.col="black",order="hclust",tl.cex=0.5,tl.offset = 0.1
+)
+```
+
+
+# Feature engineering
+```{r}
+#for the months elapsed
+train[train$issue_d == "Jan-16", "mths_since_issue"] <- 50
+train[train$issue_d == "Feb-16", "mths_since_issue"] <- 49
+train[train$issue_d == "Mar-16", "mths_since_issue"] <- 48
+
+#for the FICO score (I factorized at the end by option)
+train$FICO_score <- train$fico_range_high + train$fico_range_low
+train$FICO_score <- train$FICO_score/2
+train[train$FICO_score %in% seq(300,579) , "FICO_score"] <- "Poor"
+train[train$FICO_score %in% seq(580,669), "FICO_score"] <- "Fair"
+train[train$FICO_score %in% seq(670,739), "FICO_score"] <- "Good"
+train[train$FICO_score %in% seq(740,799), "FICO_score"] <- "Very Good"
+train[train$FICO_score %in% seq(800,850), "FICO_score"] <- "Exceptional"
+
+train$FICO_score <- as.factor(train$FICO_score)
+```
+
+
+---------------------- VISUALIZATION OF INTERESTING FEATURES ----------------------
+
+#1. Loan amount: Maximum number of loans taken is for 10k-15k USD and equals roughly 15000. Minimum number of loans taken is for 38k-40k USD and equals ~ 100
+```{r}
+ggplot(train,aes(as.numeric(loan_amnt))) + geom_histogram(bins = 30, fill = "lightblue") + theme_bw() + theme(panel.border = element_blank())
+```
+
+
+#2. Interest rate: seem extremely high?
+```{r}
+ggplot(train,aes(as.numeric(int_rate))) + geom_histogram(bins = 30, fill = "tomato") + theme_bw() + theme(panel.border = element_blank())
+```
+
+
+3. Loan amount against term: over 15,000 loans have a 36 months term, while most loans between 20k-40k USD have a 60 months term
+```{r}
+ggplot(train, aes(x = loan_amnt, fill = term)) + geom_histogram(bins = 30) + ggtitle("Loan Amount versus Term") + theme_bw() + theme(panel.border = element_blank())
+```
+
+
+4. Loan terms per state
+```{r}
+ggplot(data = train, aes(x = term, fill = addr_state)) + ggtitle("Statewise term of loan with count") + geom_bar(position = "dodge")+ geom_text(stat = 'count', aes(label = ..count..)) + theme_bw() + theme(panel.border = element_blank())
+```
+
+
+5. Loan amounts compared to employment lenght
+```{r}
+ggplot(data = train, aes(x = loan_amnt, fill = emp_length)) + geom_histogram(bins=20) + ggtitle("Borrowed amounts by employment length") + theme_bw() + theme(panel.border = element_blank())
+```
+
+
+
+--------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------- 3. CLEANING AND PRE-PROCESSING ---------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------
+
+
+-------------- PRE-PROCESSING --------------
+
+
+# Removing missing values
+```{r}
+train_num <- mutate_all(train, function(x) as.numeric(as.character(x)))
+train_no_na <- drop_na(train_num)
+train_no_na <- na.omit(train_num)
+```
+
+
+
+-------------- DIMENSIONALITY REDUCTION --------------
+
+
+# 1. Boruta method
+```{r}
+set.seed(1000)
+boruta <- Boruta(loan_status ~ ., data = train, doTrace = 2)
+```
+
+
+
+# 2. Lasso regularization
+```{r}
+set.seed(1000)
+cv_train_lasso <- cv.glmnet(x = as.matrix(train[-1]),
+                            y = train$loan_status,
+                            nfolds = 10, alpha = 1)
+plot(cv_train_lasso)
+```
+
+
+# 3. Correlation analysis
+```{r}
+#Convert dataframe to numeric
+zv1 <- apply(train_num, 2, function(x) length(unique(x)) == 1)
+train_corr <- train_num[, !zv1]
+
+#Define correlation matrix
+n = length(colnames(train_corr))
+correlationMatrix <- cor(train_corr[,1:n], use = "p")
+correlationMatrix[,1]
+
+#Subset features with correlations above 70% 
+highlyCorrelated <- findCorrelation(correlationMatrix, cutoff =(0.7), verbose = FALSE)
+highlyCorrelated
+
+#Construct dataframe and subset list of features
+sorted_corMax <- data.frame(correlationMatrix)
+subsorted_corMax <- subset(sorted_corMax, select = "loan_status")
+print(subsorted_corMax[order(-subsorted_corMax), , drop = FALSE])
+
+#Export table to pdf
+#subsorted_corMax <- kable(subsorted_corMax, format = "markdown")
+#cat(subsorted_corMax, sep="\n", file = "correlationMatrix.Rmd")
+#render("correlationMatrix.Rmd", output_format = "pdf_document")
+```
+
+
+
+£ Principal Componant Analysis
+```{r}
+train_pca <- select(train_num, -loan_status)
+pr_out <- prcomp(train_pca, center = TRUE)
+
+summary(pr_out)
+
+pr_out$x = pr_out$x
+pr_var = pr_out$sdev^2
+pve = pr_var/sum(pr_var)
+pve
+```
+
+
+
+
+
+
+
+
+
+
